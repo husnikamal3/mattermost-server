@@ -11,6 +11,7 @@ import (
 
 	"github.com/dyatlov/go-opengraph/opengraph"
 	"github.com/mattermost/mattermost-server/model"
+	"github.com/mattermost/mattermost-server/mlog"
 	"github.com/mattermost/mattermost-server/utils"
 	"github.com/mattermost/mattermost-server/utils/markdown"
 )
@@ -51,106 +52,127 @@ func (a *App) PreparePostListForClient(originalList *model.PostList) (*model.Pos
 func (a *App) PreparePostForClient(originalPost *model.Post) (*model.Post, *model.AppError) {
 	post := originalPost.Clone()
 
-	needReactionCounts := post.ReactionCounts == nil
-	needEmojis := post.Emojis == nil
-	needOpenGraphData := post.OpenGraphData == nil
-	needImageDimensions := post.ImageDimensions == nil
-
-	// Get reactions to post
-	var reactions []*model.Reaction
-	if needReactionCounts || needEmojis {
-		var err *model.AppError
-		reactions, err = a.GetReactionsForPost(post.Id)
-		if err != nil {
-			return post, err
-		}
-	}
-
-	if needReactionCounts {
-		post.ReactionCounts = model.CountReactions(reactions)
-	}
-
-	// Get emojis for post
-	if needEmojis {
-		emojis, err := a.getCustomEmojisForPost(post.Message, reactions)
-		if err != nil {
-			return post, err
-		}
-
-		post.Emojis = emojis
-	}
-
-	// Get files for post
-	if post.FileInfos == nil {
-		fileInfos, err := a.GetFileInfosForPost(post.Id, false)
-		if err != nil {
-			return post, err
-		}
-
-		post.FileInfos = fileInfos
-	}
-
-	// Proxy image links in post
+	// Proxy image links before constructing metadata so that requests go through the proxy
 	post = a.PostWithProxyAddedToImageURLs(post)
 
-	// Get OpenGraph and image metadata
-	if needOpenGraphData || needImageDimensions {
-		err := a.preparePostWithOpenGraphAndImageMetadata(post, needOpenGraphData, needImageDimensions)
-		if err != nil {
-			return post, err
+	if post.Metadata == nil {
+		post.Metadata := &model.PostMetadata{}
+
+		// Emojis and reaction counts
+		if emojis, reactionCounts, err := a.getEmojisAndReactionCountsForPost(post); err != nil {
+			mlog.Warn("Failed to get emojis and reactions for a post", mlog.String("post_id", post.Id), mlog.Any("err", err))
+		} else {
+			post.Metadata.Emojis = emojis
+			post.Metadata.ReactionCounts = reactionCounts
 		}
+
+		// Files
+		if fileInfos, err := a.GetFileInfosForPost(post.Id, false); err != nil {
+			mlog.Warn("Failed to get files for a post", mlog.String("post_id", post.Id), mlog.Any("err", err))
+		} else {
+			post.Metadata.FileInfos = fileInfos
+		}
+
+		// Embeds and image dimensions
+		firstLink, images := getFirstLinkAndImages(post.Message)
+
+		if embed, err := a.getEmbedForPost(post, firstLink); err != nil {
+			mlog.Warn("Failed to get embedded content for a post", mlog.String("post_id", post.Id), mlog.Any("err", err))
+		} else {
+			post.Metadata.Embeds = []*model.PostEmbed{embed}
+		}
+
+		post.Metadata.ImageDimensions = a.getImageDimensionsForPost(post, images)
 	}
 
 	return post, nil
 }
 
-func (a *App) preparePostWithOpenGraphAndImageMetadata(post *model.Post, needOpenGraphData, needImageDimensions bool) *model.AppError {
-	var appError *model.AppError
-
-	if needOpenGraphData {
-		post.OpenGraphData = []*opengraph.OpenGraph{}
+func (a *App) getEmojisAndReactionCountsForPost(post *model.Post) ([]*model.Emoji, model.ReactionCounts, *model.AppError) {
+	reactions, err := a.GetReactionsForPost(post.Id)
+	if err != nil {
+		return nil, nil, err
 	}
 
-	if needImageDimensions {
-		post.ImageDimensions = []*model.PostImageDimensions{}
+	emojis, err := a.getCustomEmojisForPost(post.Message, reactions)
+	if err != nil {
+		return nil, nil, err
 	}
 
-	firstLink, images := getFirstLinkAndImages(post.Message)
+	return emojis, model.CountReactions(reactions), nil
+}
 
-	// Look at the first link to see if it's a web page or an image
+func (a *App) getEmbedForPost(post *model.Post, firstLink string) (*model.PostEmbed, *model.AppError) {
+	if _, ok := post.Props["attachments"]; ok {
+		return &model.PostEmbed{
+			Type: model.POST_EMBED_MESSAGE_ATTACHMENT,
+		}, nil
+	}
+
 	if firstLink != "" {
 		og, dimensions, err := a.getLinkMetadata(firstLink, true)
 		if err != nil {
-			// Keep going so that one bad link doesn't prevent other image dimensions from being sent to the client
-			appError = model.NewAppError("PreparePostForClient", "app.post.metadata.link.app_error", nil, err.Error(), http.StatusInternalServerError)
+			return nil, err
 		}
 
-		if needOpenGraphData {
-			post.OpenGraphData = append(post.OpenGraphData, og)
+		if og != nil {
+			return &model.PostEmbed{
+				Type: model.POST_EMBED_OPENGRAPH,
+				URL:  firstLink,
+				Data: og,
+			}, nil
 		}
 
-		if needImageDimensions {
-			post.ImageDimensions = append(post.ImageDimensions, dimensions)
-		}
-	}
-
-	if needImageDimensions {
-		// And dimensions for other images
-		for _, image := range images {
-			_, dimensions, err := a.getLinkMetadata(image, true)
-			if err != nil {
-				// Keep going so that one bad link doesn't prevent other image dimensions from being sent to the client
-				appError = model.NewAppError("PreparePostForClient", "app.post.metadata.link.app_error", nil, err.Error(), http.StatusInternalServerError)
-				continue
-			}
-
-			if dimensions != nil {
-				post.ImageDimensions = append(post.ImageDimensions, dimensions)
-			}
+		if dimensions != nil {
+			// Note that we're not passing the dimensions here since they'll be part of the PostMetadata.ImageDimensions field
+			return &model.PostEmbed{
+				Type: model.POST_EMBED_IMAGE,
+				URL:  firstLink,
+			}, nil
 		}
 	}
 
-	return appError
+	return nil, nil
+}
+
+func (a *App) getImageDimensionsForPost(post *model.Post, images []string) []*model.ImageDimensions {
+	var allDimensions []*model.PostImageDimensions
+
+	for _, embed := range post.Metadata.Embeds {
+		switch embed.Type {
+		case model.POST_EMBED_IMAGE:
+			// These dimensions will generally be cached by a previous call to getEmbedForPost
+			images = append(images, embed.URL)
+
+		case model.POST_EMBED_MESSAGE_ATTACHMENT:
+			images = append(images, getImagesInPostAttachments(post)...)
+
+		case model.POST_EMBED_OPENGRAPH:
+			for _, image := range embed.Data.(*opengraph.OpenGraph).Images {
+				if image.Width != 0 || image.Height != 0 {
+					// The site has already told us the image dimensions
+					allDimensions = append(allDimensions, &model.PostImageDimensions{
+						Width:  int(image.Width),
+						Height: int(image.Height),
+					})
+				} else {
+					// The site did not specify its image dimensions
+					images = append(images, image.URL)
+				}
+			}
+		}
+	}
+
+	for _, image := range images {
+		if _, dimensions, err := a.getLinkMetadata(image, true); err != nil {
+			mlog.Warn("Failed to get dimensions of an image in a post",
+				mlog.String("post_id", post.Id), mlog.String("image_url", embed.URL), mlog.Any("err", err))
+		} else {
+			allDimensions = append(allDimensions, dimensions)
+		}
+	}
+
+	return allDimensions
 }
 
 func (a *App) getCustomEmojisForPost(message string, reactions []*model.Reaction) ([]*model.Emoji, *model.AppError) {
@@ -205,6 +227,41 @@ func getFirstLinkAndImages(str string) (string, []string) {
 	}
 
 	return firstLink, images
+}
+
+func getImagesInPostAttachments(post *model.Post) []string {
+	var images []string
+
+	for _, attachment := range post.Props["attachments"].([]map[string]interface{}) {
+		if _, ok := attachment["text"]; ok {
+			if text, ok := attachment["text"].(string); ok {
+				_, imagesInText := getFirstLinkAndImages(text)
+				images = append(images, imagesInText)
+			}
+		}
+
+		if _, ok := attachment["pretext"]; ok {
+			if pretext, ok := attachment["pretext"].(string); ok {
+				_, imagesInPretext := getFirstLinkAndImages(pretext)
+				images = append(images, imagesInPretext)
+			}
+		}
+
+		if _, ok := attachment["fields"]; ok {
+			if fields, ok := attachment["fields"].([]map[string]interface{}); ok {
+				for _, field := range fields {
+					if _, ok := field["value"]; ok {
+						if value, ok := field["value"].(string); ok {
+							_, imagesInFieldValue := getFirstLinkAndImages(value)
+							images = append(images, imagesInFieldValue)
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return images
 }
 
 func (a *App) getLinkMetadata(requestURL string, useCache bool) (*opengraph.OpenGraph, *model.PostImageDimensions, error) {
